@@ -69,7 +69,7 @@ module CrystalRuby
       method_source = extract_expr_from_source_location(method.source_location)
       parsed_source = Prism.parse(method_source).value
       params = search_node(parsed_source, Prism::ParametersNode)
-      args = params ? params.keywords.map { |kw| [kw.name, node_to_s(kw.value)] }.to_h : {}
+      args = params ? params.keywords.map { |kw| [kw.name, kw.respond_to?(:value) ? node_to_s(kw.value) : ""] }.to_h : {}
       body_node = parsed_source.statements.body[0].body
       if body_node.respond_to?(:rescue_clause) && body_node.rescue_clause
         wrapped = %(begin\n#{body_node.statements.slice}\n#{body_node.rescue_clause.slice}\nend)

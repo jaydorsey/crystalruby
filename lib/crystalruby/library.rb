@@ -237,27 +237,47 @@ module CrystalRuby
         singleton_class.class_eval do
           extend FFI::Library
           ffi_lib lib_file
-          %i[yield init gc].each do |method_name|
+          %i[yield init gc register_thread].each do |method_name|
             singleton_class.undef_method(method_name) if singleton_class.method_defined?(method_name)
             undef_method(method_name) if method_defined?(method_name)
           end
           attach_function :init, %i[string pointer pointer], :void
           attach_function :yield, %i[], :int
           attach_function :gc, %i[], :void
+          attach_function :register_thread, %i[], :void
           lib_methods.each_value.select(&:ruby).each do |method|
             attach_function :"register_#{method.name.to_s.gsub("?", "q").gsub("=", "eq").gsub("!", "bang")}_callback",
                             %i[pointer], :void
           end
         end
 
+        # Call Crystal init on the current (calling) thread before starting the reactor.
+        #
+        # Crystal's runtime setup — specifically Thread::current TLS and the fiber
+        # scheduler — must run on the thread that first calls main_user_code.  In
+        # Ruby ≤ 3.x the reactor thread happened to work for this, but Ruby 4.0
+        # introduced a new native-thread launch path (nt_start) that doesn't
+        # properly prime Crystal's __thread TLS before Thread::current is first
+        # accessed inside Crystal::once.  Moving init here ensures it always runs
+        # on the attaching (main) thread, which is safe across all Ruby versions.
+        #
+        # The Crystal-side init guard (initialized flag) makes this a no-op if
+        # called again, so the reactor thread calling it later would be harmless —
+        # but we omit that schedule_work! call entirely now.
+        init(name, Reactor::ERROR_CALLBACK, Types::Type::ARC_MUTEX.to_ptr)
+
         if CrystalRuby.config.single_thread_mode
           Reactor.init_single_thread_mode!
         else
           Reactor.start!
+          # Register the reactor thread with Crystal's runtime.  For Crystal
+          # >= 1.16.0 this calls Crystal.init_runtime, which sets up
+          # Thread::current TLS for the reactor thread and enables Fiber-based
+          # operations (async Crystal methods, Fiber.yield) from that thread.
+          # For older Crystal this is a compiled no-op, so it is always safe.
+          Reactor.schedule_work!(self, :register_thread, :void, blocking: true, async: false)
         end
 
-        Reactor.schedule_work!(self, :init, name, Reactor::ERROR_CALLBACK, Types::Type::ARC_MUTEX.to_ptr, :void,
-                               blocking: true, async: false)
         methods.values.select(&:ruby).each(&:register_callback!)
       end
     end

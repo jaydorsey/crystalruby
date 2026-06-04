@@ -31,6 +31,9 @@ module CrystalRuby
     Crystal.main_user_code(0, pointerof(argv_ptr))
     self.libname = String.new(libname)
     GC.init
+    # Must be called after GC_init and before any GC_register_my_thread calls.
+    # This enables GC_need_to_lock so foreign threads can register themselves.
+    LibGCPrivate.allow_register_threads
   end
 
   # Explicit error handling (triggers exception within Ruby on the same thread)
@@ -76,12 +79,50 @@ fun stop : Void
   LibGC.deinit
 end
 
-@[Link("gc")]
+# Register the calling thread with Crystal's runtime.
+#
+# Called from the reactor thread immediately after it starts (via Ruby's
+# Reactor.schedule_work!) so that the reactor thread has a valid
+# Thread::current and can safely use Crystal's fiber scheduler.
+#
+# IMPORTANT: We do NOT call Crystal.init_runtime here.  That function is
+# meant for process-wide initialization (it resets @@threads, @@fibers, and
+# Crystal::Once state).  Calling it on the reactor thread would destroy the
+# main thread's Thread registration in @@threads, making Thread objects
+# invisible to GC (which does not scan TLS) and eventually causing SIGSEGV
+# when TLS returns a collected Thread pointer.
+#
+# Instead we just access Thread.current, which lazily creates a per-thread
+# Thread object (with its main fiber and scheduler) without touching global
+# bookkeeping that another thread depends on.
+fun register_thread() : Void
+  sb = LibGC::StackBase.new
+  LibGCPrivate.get_stack_base(pointerof(sb))
+  LibGCPrivate.register_my_thread(pointerof(sb))
+  # Ensure a Thread object exists for the reactor thread.
+  Thread.current
+end
+
+# Crystal's stdlib (gc/boehm.cr) already declares @[Link("gc")], so
+# annotating our lib block too would produce duplicate -lgc linker flags.
+#
+# The stdlib conditionally declares `set_stackbottom` / `get_my_stackbottom`
+# in LibGC (requires -Dpreview_mt, win32, or BDW-GC >= 8.2.0).  We use
+# compile-time reflection (`LibGC.has_method?`) below to dispatch to the
+# right API, so we never declare GC_set_stackbottom ourselves — avoiding
+# "fun redefinition with different signature" on newer Crystal versions.
 lib LibGC
-  $stackbottom = GC_stackbottom : Void*
   fun deinit = GC_deinit
   fun set_finalize_on_demand = GC_set_finalize_on_demand(Int32)
   fun invoke_finalizers = GC_invoke_finalizers : Int
+end
+
+# Non-standard BDW-GC functions (get_stack_base, register_my_thread,
+# allow_register_threads) that Crystal's stdlib never declares.
+lib LibGCPrivate
+  fun get_stack_base = GC_get_stack_base(sb : LibGC::StackBase*) : Int32
+  fun register_my_thread = GC_register_my_thread(sb : LibGC::StackBase*) : Int32
+  fun allow_register_threads = GC_allow_register_threads
 end
 
 lib LibC
@@ -90,11 +131,23 @@ end
 
 module GC
   def self.current_thread_stack_bottom
-    {Pointer(Void).null, LibGC.stackbottom}
+    {%% if LibGC.has_method?(:get_my_stackbottom) %%}
+      sb = LibGC::StackBase.new
+      LibGC.get_my_stackbottom(pointerof(sb))
+      {Pointer(Void).null, sb.mem_base}
+    {%% else %%}
+      {Pointer(Void).null, LibGC.stackbottom}
+    {%% end %%}
   end
 
   def self.set_stackbottom(stack_bottom : Void*)
-    LibGC.stackbottom = stack_bottom
+    {%% if LibGC.has_method?(:set_stackbottom) %%}
+      sb = LibGC::StackBase.new
+      sb.mem_base = stack_bottom
+      LibGC.set_stackbottom(nil, pointerof(sb))
+    {%% else %%}
+      LibGC.stackbottom = stack_bottom
+    {%% end %%}
   end
 
   def self.collect
