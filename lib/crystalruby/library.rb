@@ -147,13 +147,14 @@ module CrystalRuby
 
     def build_type(type_name, expr)
       parts = type_name.split("::")
-      typedef = parts[0...-1].each_with_index.reduce("") do |acc, (part, index)|
-        acc + "#{"  " * index}module #{part}\n"
-      end
-      typedef += "#{"  " * parts.size}#{expr}\n"
-      typedef + parts[0...-1].reverse.each_with_index.reduce("") do |acc, (_part, index)|
-        acc + "#{"  " * (parts.size - 2 - index)}end\n"
-      end
+      header = parts[0...-1].each_with_index.map do |part, index|
+        "#{"  " * index}module #{part}\n"
+      end.join
+      middle = "#{"  " * parts.size}#{expr}\n"
+      footer = parts[0...-1].reverse.each_with_index.map do |_part, index|
+        "#{"  " * (parts.size - 2 - index)}end\n"
+      end.join
+      "#{header}#{middle}#{footer}"
     end
 
     def shard_file_contents

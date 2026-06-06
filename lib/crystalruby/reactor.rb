@@ -1,11 +1,27 @@
 require "json"
 
 module CrystalRuby
-  # The Reactor represents a singleton Thread responsible for running all Ruby/crystal interop code.
-  # Crystal's Fiber scheduler and GC assume all code is run on a single thread.
-  # This class is responsible for multiplexing Ruby and Crystal code onto a single thread.
-  # Functions annotated with async: true, are executed using callbacks to allow these to be interleaved
-  # without blocking multiple Ruby threads.
+  # The Reactor represents a singleton Thread responsible for running all
+  # Ruby/Crystal interop code.  Crystal's Fiber scheduler and GC assume
+  # all code is run on a single thread.  This class multiplexes Ruby and
+  # Crystal calls onto a single reactor thread (the default) OR, for
+  # synchronous (blocking + non-async) Crystal methods, allows direct
+  # FFI invocation from any Ruby thread with proper BDW-GC registration.
+  #
+  # Fast path (bypasses the queue):
+  #   Synchronous Crystal calls from foreign threads register the calling
+  #   thread with BDW-GC (GC_get_stack_base + GC_register_my_thread +
+  #   Thread.current) once, then call FFI directly.  This is safe because:
+  #
+  #   1. BDW-GC has allow_register_threads enabled, turning on its
+  #      internal locking (GC_need_to_lock) for multi-threaded access.
+  #   2. Crystal's Thread.current lazily creates per-thread state and
+  #      uses a thread-safe linked list (Crystal >= 1.16).
+  #   3. Synchronous Crystal methods do not touch the fiber scheduler
+  #      or reactor thread-local state.
+  #
+  # Async methods and blocking methods that yield to the scheduler
+  # still go through the reactor queue as before.
   module Reactor
     module_function
 
@@ -24,6 +40,10 @@ module CrystalRuby
     GC_INTERVAL = ENV.fetch("CRYSTAL_GC_INTERVAL", 0.05).to_f
     # Or if we've gotten hold of a reference to at least 100KB or more of fresh memory since last GC
     GC_BYTES_SEEN_THRESHOLD = ENV.fetch("CRYSTAL_GC_BYTES_SEEN_THRESHOLD", 100 * 1024).to_i
+
+    # Reduce expensive gc_due? checks (clock_gettime) — only perform the
+    # full check every N operations instead of every single one.
+    GC_CHECK_INTERVAL = ENV.fetch("CRYSTAL_GC_CHECK_INTERVAL", 10).to_i
 
     # We maintain a map of threads, each with a mutex, condition variable, and result
     THREAD_MAP = Hash.new do |h, tid_or_thread, tid = tid_or_thread|
@@ -118,43 +138,48 @@ module CrystalRuby
     end
 
     def invoke_gc_if_due!(lib)
-      schedule_work!(lib, :gc, :void, blocking: true, async: false, lib: lib) if lib && gc_due?
+      return unless lib
+
+      return unless gc_due?
+
+      ensure_thread_registered!(lib)
+      lib.gc
+    end
+
+    def ensure_thread_registered!(lib)
+      return if Thread.current[:cr_registered] || @single_thread_mode || Thread.current.object_id == @main_thread_id
+
+      lib.register_thread
+      Thread.current[:cr_registered] = true
     end
 
     def gc_due?
-      now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      # Cheap: memory-bytes-seen is a simple counter read, not a syscall.
+      # Check it on every call so large allocations are never missed.
+      if Types::Allocator.gc_bytes_seen > GC_BYTES_SEEN_THRESHOLD
+        Types::Allocator.gc_hint_reset!
+        return true
+      end
 
-      # Initialize state variables if not already set.
+      # Expensive: clock_gettime and arithmetic — only every Nth call.
+      @gc_check_count ||= 0
+      @gc_check_count += 1
+      return false unless (@gc_check_count % GC_CHECK_INTERVAL) == 0
+
+      now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
       @last_gc_time ||= now
       @op_count ||= 0
       @last_gc_op_count ||= @op_count
-      @last_mem_check_time ||= now
 
-      # Calculate differences based on ops and time.
       ops_since_last_gc = @op_count - @last_gc_op_count
       time_since_last_gc = now - @last_gc_time
 
-      # Start with our two “cheap” conditions.
-      due = (ops_since_last_gc >= GC_OP_THRESHOLD) || (time_since_last_gc >= GC_INTERVAL) || Types::Allocator.gc_bytes_seen > GC_BYTES_SEEN_THRESHOLD
-
-      if due
-        # Update the baseline values after GC is scheduled.
+      if ops_since_last_gc >= GC_OP_THRESHOLD || time_since_last_gc >= GC_INTERVAL
         @last_gc_time = now
-        # If we just did a memory check, use that value; otherwise, fetch one now.
         @last_gc_op_count = @op_count
-        Types::Allocator.gc_hint_reset!
         true
       else
         false
-      end
-    end
-
-    def start_gc_thread!(lib)
-      Thread.new do
-        loop do
-          schedule_work!(lib, :gc, :void, blocking: true, async: false, lib: lib) if gc_due?
-          sleep GC_INTERVAL
-        end
       end
     end
 
@@ -190,7 +215,29 @@ module CrystalRuby
       yield!(lib: lib, time: 0) unless outstanding_jobs == 0
     end
 
+    # Schedule Crystal work onto the reactor thread (or take the fast
+    # path for synchronous calls from foreign threads).
+    #
+    # Thread safety for the fast path:
+    # --------------------------------
+    # BDW-GC has been initialised with `allow_register_threads` (see
+    # index.cr), which enables GC_need_to_lock — the GC's internal
+    # mutex — making GC_{malloc,free,collect} thread-safe.
+    #
+    # Each foreign thread registers itself with BDW-GC once by calling
+    # the library's `register_thread` FFI function, which runs on that
+    # thread and calls:
+    #   GC_get_stack_base     — thread-safe BDW-GC call
+    #   GC_register_my_thread — thread-safe BDW-GC call
+    #   Thread.current        — creates per-thread state via Crystal's
+    #                           thread-safe linked list (Crystal >= 1.16)
+    #
+    # After registration the thread may call synchronous Crystal FFI
+    # functions directly.  These functions do not invoke the fiber
+    # scheduler or touch reactor-thread-local state, so no queue
+    # roundtrip is needed.
     def schedule_work!(receiver, op_name, *args, return_type, blocking: true, async: true, lib: nil)
+      # Fast path 1: already on the reactor / single-thread mode
       if @single_thread_mode || (Thread.current.object_id == @main_thread_id && op_name != :yield)
         unless Thread.current.object_id == @main_thread_id
           raise SingleThreadViolation,
@@ -199,6 +246,13 @@ module CrystalRuby
         end
         invoke_gc_if_due!(lib)
         return receiver.send(op_name, *args)
+      end
+
+      # Fast path 2: synchronous Crystal call from a foreign thread.
+      # Register the thread with BDW-GC on first use, then call FFI
+      # directly instead of routing through the reactor queue.
+      if blocking && !async && lib
+        return invoke_sync_direct!(receiver, op_name, *args, lib: lib)
       end
 
       tvars = thread_conditions
@@ -212,6 +266,11 @@ module CrystalRuby
         )
         return await_result! if blocking
       end
+    end
+
+    def invoke_sync_direct!(receiver, op_name, *args, lib:)
+      ensure_thread_registered!(lib)
+      receiver.send(op_name, *args)
     end
 
     def running?
